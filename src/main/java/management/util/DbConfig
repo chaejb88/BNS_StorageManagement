@@ -1,0 +1,20 @@
+package management.util;
+
+import lombok.Getter;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+@Getter
+public class DbConfig {
+
+    @Value("${db.url}")
+    private String url;
+
+    @Value("${db.user}")
+    private String user;
+
+    @Value("${db.password}")
+    private String password;
+
+}
