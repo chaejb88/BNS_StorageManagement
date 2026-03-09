@@ -1,0 +1,17 @@
+package storageManagement;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@Slf4j
+@EnableScheduling
+@SpringBootApplication(scanBasePackages = "management")
+public class StorageManagementApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(StorageManagementApplication.class, args);
+	}
+
+}
