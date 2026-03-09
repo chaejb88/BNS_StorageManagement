@@ -1,0 +1,34 @@
+package management.util;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.jdbc.core.JdbcTemplate;
+import com.zaxxer.hikari.HikariDataSource;
+import javax.sql.DataSource;
+
+@Configuration
+@RequiredArgsConstructor
+public class DataSourceConfig {
+
+    private final DbConfig dbConfig;
+
+    @Primary
+    @Bean(name = "dataSource")
+    public DataSource mainDataSource() {
+        HikariDataSource ds = new HikariDataSource();
+        ds.setJdbcUrl(dbConfig.getUrl());
+        ds.setUsername(dbConfig.getUser());
+        ds.setPassword(dbConfig.getPassword());
+        return ds;
+    }
+
+    @Primary
+    @Bean(name = "jdbcTemplate")
+    public JdbcTemplate mainJdbcTemplate(@Qualifier("dataSource") DataSource dataSource) {
+        return new JdbcTemplate(dataSource);
+    }
+
+}
