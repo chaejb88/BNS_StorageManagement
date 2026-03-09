@@ -1,0 +1,88 @@
+package management.storage;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.PreparedStatementCallback;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Slf4j
+@Repository
+public class StorageRepositoryImpl implements StorageRepository {
+
+    private final JdbcTemplate jdbcTemplate;
+
+    public StorageRepositoryImpl(@Qualifier("jdbcTemplate") JdbcTemplate jdbcTemplate){
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    private String qualify(String tableName) {
+        if (tableName.contains(".")) {
+            return tableName;
+        }
+        return "onboard." + tableName;
+    }
+
+    @Override
+    public List<String> findTables(String schema) {
+        String sql = """
+            SELECT tablename
+            FROM pg_tables
+            WHERE schemaname = ?
+        """;
+
+        return jdbcTemplate.queryForList(sql, String.class, schema);
+    }
+
+    @Override
+    public void dropChunks(String table, int retentionDays) {
+        String sql = "SELECT drop_chunks(?::regclass, ?::interval)";
+        String intervalLiteral = retentionDays + " days";
+        String tableName = qualify(table);
+        jdbcTemplate.execute(sql, (PreparedStatementCallback<Void>) ps -> {
+            ps.setString(1, tableName);
+            ps.setString(2, intervalLiteral);
+            ps.execute();
+            return null;
+        });
+
+
+    }
+
+    @Override
+    public int deleteOldData(String table, LocalDateTime cutoff) {
+        String sql = String.format("DELETE FROM %s WHERE created_dt < ?", qualify(table));
+        return jdbcTemplate.update(sql, cutoff);
+    }
+
+    @Override
+    public LocalDateTime findOldestTimestamp(String table) {
+        String sql = String.format("SELECT MIN(created_dt) FROM %s", qualify(table));
+        return jdbcTemplate.queryForObject(sql, LocalDateTime.class);
+    }
+
+    @Override
+    public int deleteOldestBatch(String table, int batchSize) {
+        String sql = String.format("""
+            DELETE FROM %s
+            WHERE ctid IN (
+                SELECT ctid
+                FROM %s
+                ORDER BY created_dt ASC
+                LIMIT ?
+            )
+        """, qualify(table), qualify(table));
+
+        return jdbcTemplate.update(sql, batchSize);
+    }
+
+    @Override
+    public void executeCheckpoint(String sql) {
+        jdbcTemplate.execute(sql);
+    }
+
+
+}
