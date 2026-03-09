@@ -1,0 +1,31 @@
+package management.storage;
+
+import lombok.Getter;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+@Getter
+public class StorageConfig {
+
+    @Value("${storage.disk.path}")
+    private String diskPath;
+
+    @Value("${storage.threshold1}")
+    private double threshold1;
+
+    @Value("${storage.threshold2}")
+    private double threshold2;
+
+    @Value("${storage.batchsize}")
+    private int batchSize;
+
+    @Value("${storage.check-cron}")
+    private String checkCron;
+
+    @Value("${storage.default-retention-days}")
+    private int defaultRetentionDays;
+
+    @Value("${storage.schema}")
+    private String schema;
+}
