@@ -41,5 +41,26 @@ vi /var/lib/postgresql/data/postgresql.conf
 | | autovacuum_naptime| 10s | Vacuum 실행 주기 단축 (반응성 향상) |
 | 리소스 | shared_buffers | 512MB | DB 서버 가용 RAM의 약 25% 할당 (캐시 성능) |
 | | work_mem | 32MB | 복잡한 정렬 및 집계 쿼리 성능 개선 |
+
+3. DB의 docker-compose.yml (예시)
+services:
+  bns-maindb-server:
+    image: 'timescale/timescaledb:2.17.2-pg17'
+    container_name: bns-maindb-server
+    environment:
+      - POSTGRES_PASSWORD=marisight123!@#
+      - POSTGRES_USER=marisight
+      - POSTGRES_DB=has_onb_001
+    ports:
+      - "5432:5432"
+    volumes:
+      - /data/device/pgdata:/var/lib/postgresql/data
+      - ./backups/maindb:/backups
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    logging:
+      driver: "syslog"
+      options:
+        tag: "docker.bns-maindb-server"
 | | maintenance_work_mem| 256MB | Index 생성 및 Vacuum 작업 속도 향상 |
 | 기타 | checkpoint_timeout | 15min | 불필요한 I/O 부하 감소 |
