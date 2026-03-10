@@ -26,7 +26,7 @@
 ① 컨테이너 접속 및 설정 파일 편집
 
 *컨테이너 내부 진입
-docker exec -it bns-maindb-server bash
+docker exec -it bns-maindb-server(예시) bash
 
 *설정 파일 위치 확인 및 편집 (vi 사용)
 vi /var/lib/postgresql/data/postgresql.conf
