@@ -20,13 +20,15 @@
 
 2. PostgreSQL & TimescaleDB 성능 최적화 (Optimization)
 대량의 데이터 삭제(drop_chunks) 및 빈번한 정렬 작업이 발생하는 운영 환경에 맞춰 컨테이너 내부 설정을 직접 최적화했습니다.
+
 🛠 설정 변경 절차
+
 ① 컨테이너 접속 및 설정 파일 편집
 
-컨테이너 내부 진입
+*컨테이너 내부 진입
 docker exec -it bns-maindb-server bash
 
-설정 파일 위치 확인 및 편집 (vi 사용)
+*설정 파일 위치 확인 및 편집 (vi 사용)
 vi /var/lib/postgresql/data/postgresql.conf
 
 ② 주요 설정값 수정 (postgresql.conf)
