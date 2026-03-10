@@ -43,6 +43,7 @@ vi /var/lib/postgresql/data/postgresql.conf
 | | work_mem | 32MB | 복잡한 정렬 및 집계 쿼리 성능 개선 |
 
 3. DB의 docker-compose.yml (예시)
+   
 services:
   bns-maindb-server:
     image: 'timescale/timescaledb:2.17.2-pg17'
