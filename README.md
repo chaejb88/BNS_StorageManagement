@@ -46,6 +46,185 @@ vi /var/lib/postgresql/data/postgresql.conf
 | | maintenance_work_mem| 256MB | Index 생성 및 Vacuum 작업 속도 향상 |
 | 기타 | checkpoint_timeout | 15min | 불필요한 I/O 부하 감소 |
 
+Ubuntu 설정 방법
+# 1) 컨테이너 내부로 진입
+
+```bash
+docker exec -it bns-maindb-server bash
+```
+
+---
+
+# 2) PostgreSQL 설정 파일 위치 확인
+
+TimescaleDB 공식 이미지 기준:
+
+```
+/var/lib/postgresql/data/postgresql.conf
+```
+
+또는
+
+```
+/var/lib/postgresql/data/pgdata/postgresql.conf
+```
+
+jb는 `/data/device/pgdata` 를 volume으로 마운트했기 때문에  
+컨테이너 내부에서는:
+
+```
+/var/lib/postgresql/data/postgresql.conf
+```
+
+이 파일이 실제로 jb의 호스트 `/data/device/pgdata/postgresql.conf` 와 연결됨.
+
+---
+
+# 3) postgresql.conf 열기
+
+컨테이너 내부에서:
+
+```bash
+vi /var/lib/postgresql/data/postgresql.conf
+```
+
+---
+
+# 4) 우리가 수정했던 주요 설정들
+
+아래는 jb가 실제로 수정했던 항목들이다.
+
+---
+
+## ✔ 4-1) WAL 크기 조정
+
+### max_wal_size
+
+```conf
+max_wal_size = 2GB
+```
+
+### min_wal_size
+
+```conf
+min_wal_size = 80MB
+```
+
+이 설정은:
+
+- TimescaleDB에서 대량 DELETE / drop_chunks 후 WAL 폭증 방지
+- checkpoint 빈도 조절
+- 디스크 사용량 안정화
+
+을 위해 조정했던 값.
+
+---
+
+## ✔ 4-2) autovacuum 관련 설정
+
+우리가 조정했던 값:
+
+```conf
+autovacuum = on
+autovacuum_max_workers = 5
+autovacuum_naptime = 10s
+autovacuum_vacuum_scale_factor = 0.1
+autovacuum_analyze_scale_factor = 0.05
+```
+
+이 설정은:
+
+- fallback DELETE 후 dead tuple이 많이 생기므로
+- autovacuum이 빠르게 처리하도록 조정한 것
+
+---
+
+## ✔ 4-3) checkpoint 관련 설정
+
+```conf
+checkpoint_timeout = 15min
+checkpoint_completion_target = 0.9
+```
+
+이건:
+
+- drop_chunks / DELETE 후 checkpoint가 너무 자주 발생하지 않도록
+- 하지만 너무 늦게도 발생하지 않도록
+- 안정적인 I/O 유지 목적
+
+---
+
+## ✔ 4-4) shared_buffers
+
+```conf
+shared_buffers = 512MB
+```
+
+TimescaleDB는 shared_buffers를 RAM의 25% 정도로 권장.  
+jb 환경에서는 512MB로 설정했던 것.
+
+---
+
+## ✔ 4-5) work_mem
+
+```conf
+work_mem = 32MB
+```
+
+정렬/집계가 많은 hypertable 환경에서 기본값(4MB)은 너무 작아서 조정.
+
+---
+
+## ✔ 4-6) maintenance_work_mem
+
+```conf
+maintenance_work_mem = 256MB
+```
+
+VACUUM / ANALYZE / drop_chunks 후 정리 작업 속도 향상.
+
+---
+
+## ✔ 4-7) TimescaleDB background worker 활성화
+
+이건 postgresql.conf가 아니라 docker-compose에서 설정했지만  
+컨테이너 내부에서 확인했던 값:
+
+```conf
+shared_preload_libraries = 'timescaledb'
+```
+
+컨테이너 내부에서 확인:
+
+```sql
+SHOW shared_preload_libraries;
+```
+
+결과:
+
+```
+timescaledb
+```
+
+---
+
+# 5) 설정 변경 후 PostgreSQL 재시작
+
+컨테이너 내부에서 PostgreSQL만 재시작할 수 없기 때문에  
+우분투에서 컨테이너를 재시작했다:
+
+```bash
+docker restart bns-maindb-server
+```
+
+또는 docker-compose 사용 시:
+
+```bash
+docker-compose down
+docker-compose up -d
+```
+
+
 3. DB의 docker-compose.yml (예시)
 
 services: <br/>
