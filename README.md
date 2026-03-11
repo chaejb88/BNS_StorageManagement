@@ -90,9 +90,7 @@ vi /var/lib/postgresql/data/postgresql.conf
 
 ---
 
-# 4) 우리가 수정했던 주요 설정들
-
-아래는 jb가 실제로 수정했던 항목들이다.
+# 4) 수정했던 주요 설정들
 
 ---
 
