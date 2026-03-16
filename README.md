@@ -69,15 +69,6 @@ TimescaleDB 공식 이미지 기준:
 /var/lib/postgresql/data/pgdata/postgresql.conf
 ```
 
-jb는 `/data/device/pgdata` 를 volume으로 마운트했기 때문에  
-컨테이너 내부에서는:
-
-```
-/var/lib/postgresql/data/postgresql.conf
-```
-
-이 파일이 실제로 jb의 호스트 `/data/device/pgdata/postgresql.conf` 와 연결됨.
-
 ---
 
 # 3) postgresql.conf 열기
@@ -90,7 +81,7 @@ vi /var/lib/postgresql/data/postgresql.conf
 
 ---
 
-# 4) 수정했던 주요 설정들
+# 4) 수정 설정들
 
 ---
 
@@ -114,13 +105,11 @@ min_wal_size = 80MB
 - checkpoint 빈도 조절
 - 디스크 사용량 안정화
 
-을 위해 조정했던 값.
 
 ---
 
 ## ✔ 4-2) autovacuum 관련 설정
 
-우리가 조정했던 값:
 
 ```conf
 autovacuum = on
