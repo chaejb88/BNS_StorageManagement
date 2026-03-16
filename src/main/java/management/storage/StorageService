@@ -135,7 +135,8 @@ public class StorageService {
             boolean anyDeleted = false;
 
             for (String table : tables) {
-                String fullTable = config.getSchema() + "." + table;
+//                String fullTable = config.getSchema() + "." + table;
+                String fullTable = table;
 
                 try {
                     if (!forceDeleteMode) {
