@@ -70,6 +70,8 @@ public class StorageService {
         log.info("Disk usage: {}%", String.format("%.2f", usage));
 
         if (usage < t1) {
+            log.info("[OK] Disk usage ({}%) is below threshold1 ({}%). No cleanup required.",
+                    String.format("%.2f", usage), t1);
             return;
         }
 
@@ -84,7 +86,6 @@ public class StorageService {
 
             // 삭제 후 용량 확보 작업
             runCheckpoint();
-            runZeroFill();
         }
     }
 
@@ -100,19 +101,6 @@ public class StorageService {
         }
     }
 
-    /**
-     * Zero-filling ext4 free blocks
-     */
-    private void runZeroFill() {
-        try {
-            String path = config.getDiskPath();
-            Runtime.getRuntime().exec("bash -c 'dd if=/dev/zero of=" + path + "/zero.fill bs=1M || true'");
-            Runtime.getRuntime().exec("bash -c 'rm " + path + "/zero.fill'");
-            log.info("Zero-fill completed.");
-        } catch (Exception e) {
-            log.warn("Zero-fill failed: {}", e.getMessage());
-        }
-    }
 
     /**
      * Repeat deletion until the threshold is reduced to 1
