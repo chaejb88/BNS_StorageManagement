@@ -4,10 +4,11 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.time.LocalDateTime;
-import java.time.temporal.ChronoUnit;
+import java.io.IOException;
+import java.nio.file.FileStore;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 @Slf4j
@@ -18,80 +19,63 @@ public class StorageService {
     private final StorageConfig config;
     private final StorageRepository repository;
 
-    /**
-     * Disk Usage Calculation
-     */
+    private static final String LOCK_KEY = "storage-cleanup-lock";
+
     public double getUsagePercent() {
-        String path = config.getDiskPath();
-
+        String pathStr = config.getDiskPath();
         try {
-            Process process = new ProcessBuilder("bash", "-c", "LANG=C df -P -B1 " + path).start();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            Path path = FileSystems.getDefault().getPath(pathStr);
+            FileStore store = Files.getFileStore(path);
+            long total = store.getTotalSpace();
+            long usable = store.getUsableSpace();
+            long used = total - usable;
+            return total == 0 ? 0.0 : (used * 100.0 / total);
+        } catch (IOException e) {
+            log.error("Failed to get FileStore for {}: {}", pathStr, e.getMessage());
+            // fallback to 0 to avoid accidental deletion if measurement fails
+            return 0.0;
+        }
+    }
 
-            String line;
-            boolean headerSkipped = false;
-
-            while ((line = reader.readLine()) != null) {
-                if (!headerSkipped) {
-                    headerSkipped = true;
-                    continue;
-                }
-
-                String[] parts = line.trim().split("\\s+");
-                if (parts.length < 6) {
-                    log.warn("Unexpected df output format: {}", line);
-                    continue;
-                }
-
-                long used = Long.parseLong(parts[2]);
-                long avail = Long.parseLong(parts[3]);
-                long total = used + avail;
-
-                if (total == 0) return 0;
-
-                return (used * 100.0) / total;
+    public void checkStorage() throws InterruptedException {
+        // Try to acquire advisory lock to prevent concurrent runs
+        boolean locked = false;
+        try {
+            locked = repository.tryAcquireLock(LOCK_KEY);
+            if (!locked) {
+                log.info("Another cleanup is running. Exiting.");
+                return;
             }
 
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to get disk usage for path: " + path, e);
-        }
+            double usage = getUsagePercent();
+            double t1 = config.getThreshold1();
+            double t2 = config.getThreshold2();
 
-        return 0;
-    }
+            log.info("Disk usage: {}%", String.format("%.2f", usage));
 
-    /**
-     * Main logic: threshold check + delete
-     */
-    public void checkStorage() throws InterruptedException {
-        double usage = getUsagePercent();
-        double t1 = config.getThreshold1();
-        double t2 = config.getThreshold2();
+            if (usage < t1) {
+                log.info("[OK] Disk usage ({}%) is below threshold1 ({}%). No cleanup required.",
+                        String.format("%.2f", usage), t1);
+                return;
+            }
 
-        log.info("Disk usage: {}%", String.format("%.2f", usage));
+            if (usage >= t1 && usage < t2) {
+                log.warn("[WARNING] Disk usage {}% >= threshold1 {}%", usage, t1);
+                return;
+            }
 
-        if (usage < t1) {
-            log.info("[OK] Disk usage ({}%) is below threshold1 ({}%). No cleanup required.",
-                    String.format("%.2f", usage), t1);
-            return;
-        }
-
-        if (usage >= t1 && usage < t2) {
-            log.warn("[WARNING] Disk usage {}% >= threshold1 {}%", usage, t1);
-            return;
-        }
-
-        if (usage >= t2) {
-            log.error("[CRITICAL] Disk usage {}% >= threshold2 {}%", usage, t2);
-            cleanupUntilThreshold1();
-
-            // 삭제 후 용량 확보 작업
-            runCheckpoint();
+            if (usage >= t2) {
+                log.error("[CRITICAL] Disk usage {}% >= threshold2 {}%", usage, t2);
+                cleanupUntilThreshold1();
+                runCheckpoint();
+            }
+        } finally {
+            if (locked) {
+                repository.releaseLock(LOCK_KEY);
+            }
         }
     }
 
-    /**
-     * Running PostgreSQL CHECKPOINT
-     */
     private void runCheckpoint() {
         try {
             repository.executeCheckpoint("CHECKPOINT");
@@ -102,9 +86,6 @@ public class StorageService {
     }
 
 
-    /**
-     * Repeat deletion until the threshold is reduced to 1
-     */
     private void cleanupUntilThreshold1() throws InterruptedException {
         double usage = getUsagePercent();
         double target = config.getThreshold1();
@@ -116,70 +97,61 @@ public class StorageService {
         boolean forceDeleteMode = false;
 
         while (usage > target) {
-
             log.info("Cleanup iteration {} | retentionDays={} | usage={} | target={} | forceDeleteMode={}",
                     iteration, retention, usage, target, forceDeleteMode);
 
-            boolean anyDeleted = false;
+            boolean anyDeletedThisIteration = false;
 
             for (String table : tables) {
-//                String fullTable = config.getSchema() + "." + table;
-                String fullTable = table;
+                if (table == null || table.isBlank()) continue;
 
                 try {
-                    if (!forceDeleteMode) {
-                        repository.dropChunks(fullTable, retention);
-                        log.info("drop_chunks executed on {}", fullTable);
-                        anyDeleted = true;
-
-                    } else {
-                        LocalDateTime oldest = repository.findOldestTimestamp(fullTable);
-                        if (oldest == null) {
-                            log.info("No data left in {}", fullTable);
-                            continue;
-                        }
-
-                        int deleted = repository.deleteOldestBatch(fullTable, config.getBatchSize());
-                        log.info("Force deleted {} rows from {}", deleted, fullTable);
-
-                        if (deleted > 0) anyDeleted = true;
+                    // 1) 먼저 삭제 대상 존재 여부 확인
+                    int candidates = repository.countRowsOlderThan(config.getSchema(), table, retention);
+                    if (candidates == 0 && !forceDeleteMode) {
+                        log.info("No rows older than {} days in {}.{}. Skipping drop_chunks.", retention, config.getSchema(), table);
+                        continue;
                     }
 
+                    if (!forceDeleteMode) {
+                        // show_chunks로 청크 존재 확인 (선택적)
+                        List<String> chunks = repository.showChunksOlderThan(config.getSchema(), table, retention);
+                        if (chunks == null || chunks.isEmpty()) {
+                            log.info("No chunks older than {} days for {}.{}. Skipping drop_chunks.", retention, config.getSchema(), table);
+                        } else {
+                            repository.dropChunks(config.getSchema(), table, retention);
+                            log.info("drop_chunks executed on {}.{} (chunks removed: {})", config.getSchema(), table, chunks.size());
+                            anyDeletedThisIteration = true;
+                        }
+                    } else {
+                        // force delete: 배치 삭제
+                        int deleted = repository.deleteOldestBatch(config.getSchema(), table, config.getBatchSize());
+                        log.info("Force deleted {} rows from {}.{}", deleted, config.getSchema(), table);
+                        if (deleted > 0) anyDeletedThisIteration = true;
+                    }
                 } catch (Exception e) {
-                    log.warn("drop_chunks failed on {}. fallback DELETE. reason={}", fullTable, e.getMessage());
-
-                    if (!forceDeleteMode) {
-                        LocalDateTime cutoff = LocalDateTime.now().minus(retention, ChronoUnit.DAYS);
-                        int deleted = repository.deleteOldData(fullTable, cutoff);
-                        log.info("Fallback deleted {} rows from {}", deleted, fullTable);
-                        if (deleted > 0) anyDeleted = true;
-
-                    } else {
-                        LocalDateTime oldest = repository.findOldestTimestamp(fullTable);
-                        if (oldest != null) {
-                            int deleted = repository.deleteOldestBatch(fullTable, config.getBatchSize());
-                            log.info("Force deleted {} rows from {}", deleted, fullTable);
-                            if (deleted > 0) anyDeleted = true;
-                        }
-                    }
+                    log.warn("Error processing {}.{}: {}. Continue.", config.getSchema(), table, e.getMessage());
                 }
+
+                // 목표 달성 시 조기 종료
+                usage = getUsagePercent();
+                if (usage <= target) break;
             }
 
-            if (!anyDeleted && !forceDeleteMode) {
-                log.warn("No data deleted with retentionDays {}. Switching to FORCE DELETE mode.", retention);
+            if (!anyDeletedThisIteration && !forceDeleteMode) {
+                log.warn("No data deleted in this iteration with retentionDays {}. Switching to FORCE DELETE mode.", retention);
                 forceDeleteMode = true;
                 continue;
             }
 
-            if (!anyDeleted && forceDeleteMode) {
+            if (!anyDeletedThisIteration && forceDeleteMode) {
                 log.warn("No more data to delete even in FORCE DELETE mode. Stopping cleanup.");
                 break;
             }
 
             Thread.sleep(5000);
-
             usage = getUsagePercent();
-            log.info("After iteration {}, current disk usage: {}%", iteration, usage);
+            log.info("After iteration {}, current disk usage: {}%", iteration, String.format("%.2f", usage));
 
             if (!forceDeleteMode) {
                 retention = Math.max(1, retention / 2);
@@ -188,6 +160,7 @@ public class StorageService {
             iteration++;
         }
 
-        log.info("Cleanup finished. Current usage: {}%", String.format("%.2f", usage));
+        log.info("Cleanup finished. Current usage: {}%", String.format("%.2f", getUsagePercent()));
     }
+
 }
