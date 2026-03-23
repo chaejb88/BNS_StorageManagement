@@ -5,23 +5,20 @@ import java.util.List;
 
 public interface StorageRepository {
 
-    // Query all tables in a schema
     List<String> findTables(String schema);
 
-    // Run TimescaleDB drop_chunks
-    void dropChunks(String table, int retentionDays);
+    void dropChunks(String schema, String table, int retentionDays);
 
-    // Generic PostgreSQL DELETE fallback
-    int deleteOldData(String table, LocalDateTime cutoff);
+    int deleteOldestBatch(String schema, String table, int batchSize);
 
-    // Find the oldest timestamp
-    LocalDateTime findOldestTimestamp(String table);
-
-    // Delete the oldest batch of data
-    int deleteOldestBatch(String table, int batchSize);
-
-    // Run checkpoint
     void executeCheckpoint(String sql);
 
+    boolean tryAcquireLock(String lockKey);
+
+    void releaseLock(String lockKey);
+
+    int countRowsOlderThan(String schema, String table, int days);
+
+    List<String> showChunksOlderThan(String schema, String table, int days);
 
 }
