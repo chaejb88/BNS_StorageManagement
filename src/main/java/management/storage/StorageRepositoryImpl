@@ -6,9 +6,6 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.PreparedStatementCallback;
 import org.springframework.stereotype.Repository;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.time.LocalDateTime;
 import java.util.List;
 
 @Slf4j
@@ -17,14 +14,35 @@ public class StorageRepositoryImpl implements StorageRepository {
 
     private final JdbcTemplate jdbcTemplate;
 
+    /**
+     * 생성자
+     *
+     * @param jdbcTemplate JDBC 연동을 위한 JdbcTemplate (빈 이름 "jdbcTemplate" 사용)
+     */
     public StorageRepositoryImpl(@Qualifier("jdbcTemplate") JdbcTemplate jdbcTemplate){
         this.jdbcTemplate = jdbcTemplate;
     }
 
+    /**
+     * 식별자 유효성 검사
+     *
+     * 스키마명이나 테이블명에 대해 간단한 화이트리스트 검사를 수행합니다.
+     * - null이 아니어야 하며 영문자, 숫자, 밑줄만 허용합니다.
+     * - SQL 식별자 주입 공격을 방지하기 위한 1차 방어입니다.
+     *
+     * @param s 검사할 문자열
+     * @return 유효하면 true, 아니면 false
+     */
     private boolean isValidIdentifier(String s) {
         return s != null && s.matches("[a-zA-Z0-9_]+");
     }
 
+    /**
+     * 지정 스키마의 테이블 목록을 조회합니다.
+     *
+     * @param schema 조회할 스키마 이름
+     * @return 테이블 이름 리스트
+     */
     @Override
     public List<String> findTables(String schema) {
         String sql = """
@@ -35,6 +53,19 @@ public class StorageRepositoryImpl implements StorageRepository {
         return jdbcTemplate.queryForList(sql, String.class, schema);
     }
 
+    /**
+     * TimescaleDB의 drop_chunks 함수를 호출하여 오래된 청크를 제거합니다.
+     *
+     * 구현 세부:
+     * - 스키마/테이블 식별자 유효성 검사 수행
+     * - qualified 이름(schema.table)을 regclass로 전달
+     * - PreparedStatementCallback을 사용해 파라미터 바인딩 후 실행
+     *
+     * @param schema 스키마 이름
+     * @param table 테이블 이름
+     * @param retentionDays 보존일수 (이 일수보다 오래된 청크를 삭제)
+     * @throws IllegalArgumentException 식별자 검증 실패 시 발생
+     */
     @Override
     public void dropChunks(String schema, String table, int retentionDays) {
         if (!isValidIdentifier(schema) || !isValidIdentifier(table)) {
@@ -50,6 +81,23 @@ public class StorageRepositoryImpl implements StorageRepository {
         });
     }
 
+    /**
+     * 테이블에서 가장 오래된 레코드들을 배치 단위로 삭제합니다.
+     *
+     * 구현 세부:
+     * - ctid를 이용해 물리적 행을 선택하여 삭제 (성능상 유리할 수 있음)
+     * - 스키마/테이블 식별자 유효성 검사 수행
+     * - 삭제된 행 수를 반환
+     *
+     * 주의:
+     * - SQL 문자열에 테이블명을 직접 포맷팅하므로 isValidIdentifier로 검증을 반드시 수행합니다.
+     *
+     * @param schema 스키마 이름
+     * @param table 테이블 이름
+     * @param batchSize 한 번에 삭제할 행 수 (LIMIT)
+     * @return 삭제된 행 수
+     * @throws IllegalArgumentException 식별자 검증 실패 시 발생
+     */
     @Override
     public int deleteOldestBatch(String schema, String table, int batchSize) {
         if (!isValidIdentifier(schema) || !isValidIdentifier(table)) {
@@ -67,11 +115,29 @@ public class StorageRepositoryImpl implements StorageRepository {
         return jdbcTemplate.update(sql, batchSize);
     }
 
+    /**
+     * 전달된 SQL을 그대로 실행합니다.
+     *
+     * 사용 예:
+     * - DB 체크포인트 실행: executeCheckpoint("CHECKPOINT");
+     *
+     * @param sql 실행할 SQL 문자열
+     */
     @Override
     public void executeCheckpoint(String sql) {
         jdbcTemplate.execute(sql);
     }
 
+    /**
+     * PostgreSQL advisory lock을 시도하여 획득 여부를 반환합니다.
+     *
+     * 구현 세부:
+     * - hashtext(?)를 사용해 문자열 키를 정수로 해시하여 잠금에 사용
+     * - pg_try_advisory_lock은 블로킹하지 않고 즉시 결과를 반환
+     *
+     * @param lockKey 잠금에 사용할 키 문자열
+     * @return 잠금 획득 성공 시 true, 실패 시 false
+     */
     @Override
     public boolean tryAcquireLock(String lockKey) {
         String sql = "SELECT pg_try_advisory_lock(hashtext(?))";
@@ -79,6 +145,15 @@ public class StorageRepositoryImpl implements StorageRepository {
         return Boolean.TRUE.equals(acquired);
     }
 
+    /**
+     * PostgreSQL advisory lock을 해제합니다.
+     *
+     * 구현 세부:
+     * - pg_advisory_unlock(hashtext(?)) 호출
+     * - 해제 실패 시 예외를 던지지 않고 경고 로그를 남깁니다.
+     *
+     * @param lockKey 해제할 잠금 키
+     */
     @Override
     public void releaseLock(String lockKey) {
         String sql = "SELECT pg_advisory_unlock(hashtext(?))";
@@ -89,19 +164,28 @@ public class StorageRepositoryImpl implements StorageRepository {
         }
     }
 
-
-    @Override
-    public int countRowsOlderThan(String schema, String table, int days) {
-        String qualified = schema + "." + table;
-        String sql = String.format("SELECT count(*) FROM %s WHERE created_dt < now() - (? || ' days')::interval", qualified);
-        return jdbcTemplate.queryForObject(sql, Integer.class, days);
-    }
-
+    /**
+     * TimescaleDB의 show_chunks 함수를 호출하여 지정 테이블에서 오래된 청크 목록을 반환합니다.
+     *
+     * @param schema 스키마 이름
+     * @param table 테이블 이름
+     * @param days 오래된 기준 일수
+     * @return 오래된 청크 이름 리스트
+     */
     @Override
     public List<String> showChunksOlderThan(String schema, String table, int days) {
         String qualified = schema + "." + table;
         String sql = "SELECT show_chunks(?::regclass, older_than => (? || ' days')::interval)";
         return jdbcTemplate.queryForList(sql, String.class, qualified, days);
+    }
+
+    @Override
+    public void vacuumTable(String schema, String table) {
+        if (!isValidIdentifier(schema) || !isValidIdentifier(table)) {
+            throw new IllegalArgumentException("Invalid schema or table name");
+        }
+        String sql = String.format("VACUUM %s.%s", schema, table);
+        jdbcTemplate.execute(sql);
     }
 
 }
