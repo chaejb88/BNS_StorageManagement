@@ -4,12 +4,10 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.io.IOException;
-import java.nio.file.FileStore;
-import java.nio.file.FileSystems;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.math.BigDecimal;
 import java.util.List;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 
 @Slf4j
 @Service
@@ -19,26 +17,62 @@ public class StorageService {
     private final StorageConfig config;
     private final StorageRepository repository;
 
+    /**
+     * 프로세스 간 동시 실행을 방지하기 위한 advisory lock 키
+     * - DB의 pg_try_advisory_lock / pg_advisory_unlock에 사용됩니다.
+     */
     private static final String LOCK_KEY = "storage-cleanup-lock";
 
+    /**
+     * getUsagePercent
+     * <p>
+     * 디스크 사용률(%)을 계산하여 반환합니다.
+     * - config.getDiskPath()로 지정된 경로의 FileStore를 조회하여 총 용량(total)과 사용 가능 용량(usable)을 가져옵니다.
+     * - 사용량 = (total - usable) / total * 100
+     * - FileStore 조회 실패 시 예외를 로깅하고 안전을 위해 0.0을 반환합니다(오탐으로 인한 삭제 방지).
+     *
+     * @return 디스크 사용률(퍼센트, 소수점 포함). 측정 실패 시 0.0 반환.
+     */
     public double getUsagePercent() {
         String pathStr = config.getDiskPath();
         try {
-            Path path = FileSystems.getDefault().getPath(pathStr);
-            FileStore store = Files.getFileStore(path);
-            long total = store.getTotalSpace();
-            long usable = store.getUsableSpace();
-            long used = total - usable;
-            return total == 0 ? 0.0 : (used * 100.0 / total);
-        } catch (IOException e) {
-            log.error("Failed to get FileStore for {}: {}", pathStr, e.getMessage());
-            // fallback to 0 to avoid accidental deletion if measurement fails
+            Process process = new ProcessBuilder("df", "-P", pathStr)
+                    .redirectErrorStream(true)
+                    .start();
+
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(process.getInputStream()))) {
+                reader.readLine(); // 헤더 스킵
+                String line = reader.readLine();
+                if (line == null) {
+                    log.error("df returned no data for {}", pathStr);
+                    return 0.0;
+                }
+                // Filesystem  1024-blocks  Used  Available  Capacity  Mounted-on
+                String[] parts = line.trim().split("\\s+");
+                if (parts.length < 5) {
+                    log.error("Unexpected df output: {}", line);
+                    return 0.0;
+                }
+                long total = Long.parseLong(parts[1]);
+                long used = Long.parseLong(parts[2]);
+                return total == 0 ? 0.0 : (used * 100.0 / total);
+            } finally {
+                process.waitFor();
+            }
+        } catch (Exception e) {
+            log.error("Failed to run df for {}: {}", pathStr, e.getMessage());
             return 0.0;
         }
     }
 
+    /**
+     * checkStorage
+     * <p>
+     * 주기적으로 호출되어 디스크 사용량을 확인하고 필요 시 정리 작업을 수행합니다.
+     * @throws InterruptedException cleanup 루프에서 Thread.sleep이 인터럽트될 경우 전달됨
+     */
     public void checkStorage() throws InterruptedException {
-        // Try to acquire advisory lock to prevent concurrent runs
         boolean locked = false;
         try {
             locked = repository.tryAcquireLock(LOCK_KEY);
@@ -50,22 +84,27 @@ public class StorageService {
             double usage = getUsagePercent();
             double t1 = config.getThreshold1();
             double t2 = config.getThreshold2();
+            String usageStr = BigDecimal.valueOf(usage).toPlainString();
+            String t1Str = BigDecimal.valueOf(t1).toPlainString();
+            String t2Str = BigDecimal.valueOf(t2).toPlainString();
 
-            log.info("Disk usage: {}%", String.format("%.2f", usage));
+            log.info("Disk usage: {}%", usageStr);
 
             if (usage < t1) {
                 log.info("[OK] Disk usage ({}%) is below threshold1 ({}%). No cleanup required.",
-                        String.format("%.2f", usage), t1);
+                        usageStr, t1Str);
                 return;
             }
 
             if (usage >= t1 && usage < t2) {
-                log.warn("[WARNING] Disk usage {}% >= threshold1 {}%", usage, t1);
+                log.warn("[WARNING] Disk usage {}% >= threshold1 {}%",
+                        usageStr, t1Str);
                 return;
             }
 
             if (usage >= t2) {
-                log.error("[CRITICAL] Disk usage {}% >= threshold2 {}%", usage, t2);
+                log.error("[CRITICAL] Disk usage {}% >= threshold2 {}%",
+                        usageStr, t2Str);
                 cleanupUntilThreshold1();
                 runCheckpoint();
             }
@@ -76,6 +115,13 @@ public class StorageService {
         }
     }
 
+    /**
+     * runCheckpoint
+     * <p>
+     * 데이터베이스에 CHECKPOINT 명령을 실행합니다.
+     * - CHECKPOINT 실행 성공/실패를 로깅합니다.
+     * - 실패 시 예외를 던지지 않고 경고 로그만 남깁니다(정리 작업의 보조 동작).
+     */
     private void runCheckpoint() {
         try {
             repository.executeCheckpoint("CHECKPOINT");
@@ -86,6 +132,12 @@ public class StorageService {
     }
 
 
+    /**
+     * cleanupUntilThreshold1
+     * <p>
+     * 디스크 사용량이 설정된 목표 임계치(threshold1) 이하가 될 때까지 데이터를 삭제하는 핵심 정리 루틴입니다.
+     * @throws InterruptedException Thread.sleep에서 인터럽트 발생 시 전달
+     */
     private void cleanupUntilThreshold1() throws InterruptedException {
         double usage = getUsagePercent();
         double target = config.getThreshold1();
@@ -95,72 +147,103 @@ public class StorageService {
 
         int iteration = 0;
         boolean forceDeleteMode = false;
+        int noProgressCount = 0;
 
         while (usage > target) {
+            String usageStr = BigDecimal.valueOf(usage).toPlainString();
+            String targetStr = BigDecimal.valueOf(target).toPlainString();
             log.info("Cleanup iteration {} | retentionDays={} | usage={} | target={} | forceDeleteMode={}",
-                    iteration, retention, usage, target, forceDeleteMode);
+                    iteration, retention, usageStr, targetStr, forceDeleteMode);
 
             boolean anyDeletedThisIteration = false;
 
             for (String table : tables) {
                 if (table == null || table.isBlank()) continue;
-
                 try {
-                    // 1) 먼저 삭제 대상 존재 여부 확인
-                    int candidates = repository.countRowsOlderThan(config.getSchema(), table, retention);
-                    if (candidates == 0 && !forceDeleteMode) {
-                        log.info("No rows older than {} days in {}.{}. Skipping drop_chunks.", retention, config.getSchema(), table);
-                        continue;
-                    }
-
                     if (!forceDeleteMode) {
-                        // show_chunks로 청크 존재 확인 (선택적)
-                        List<String> chunks = repository.showChunksOlderThan(config.getSchema(), table, retention);
-                        if (chunks == null || chunks.isEmpty()) {
-                            log.info("No chunks older than {} days for {}.{}. Skipping drop_chunks.", retention, config.getSchema(), table);
-                        } else {
+                        // drop_chunks 우선 (TimescaleDB hypertable이면 청크 파일이 통째로 사라짐)
+                        List<String> chunks = repository.showChunksOlderThan(
+                                config.getSchema(), table, retention);
+                        if (chunks != null && !chunks.isEmpty()) {
                             repository.dropChunks(config.getSchema(), table, retention);
-                            log.info("drop_chunks executed on {}.{} (chunks removed: {})", config.getSchema(), table, chunks.size());
+                            log.info("drop_chunks on {}.{} (chunks: {}, retention: {} days)",
+                                    config.getSchema(), table, chunks.size(), retention);
                             anyDeletedThisIteration = true;
+                        } else {
+                            log.info("No chunks older than {} days for {}.{}",
+                                    retention, config.getSchema(), table);
                         }
                     } else {
-                        // force delete: 배치 삭제
-                        int deleted = repository.deleteOldestBatch(config.getSchema(), table, config.getBatchSize());
-                        log.info("Force deleted {} rows from {}.{}", deleted, config.getSchema(), table);
+                        int deleted = repository.deleteOldestBatch(
+                                config.getSchema(), table, config.getBatchSize());
+                        log.info("Force deleted {} rows from {}.{}",
+                                deleted, config.getSchema(), table);
                         if (deleted > 0) anyDeletedThisIteration = true;
                     }
                 } catch (Exception e) {
-                    log.warn("Error processing {}.{}: {}. Continue.", config.getSchema(), table, e.getMessage());
+                    log.warn("Error processing {}.{}: {}", config.getSchema(), table, e.getMessage());
                 }
-
-                // 목표 달성 시 조기 종료
-                usage = getUsagePercent();
-                if (usage <= target) break;
             }
 
-            if (!anyDeletedThisIteration && !forceDeleteMode) {
-                log.warn("No data deleted in this iteration with retentionDays {}. Switching to FORCE DELETE mode.", retention);
-                forceDeleteMode = true;
-                continue;
-            }
-
-            if (!anyDeletedThisIteration && forceDeleteMode) {
-                log.warn("No more data to delete even in FORCE DELETE mode. Stopping cleanup.");
-                break;
+            // 삭제가 있었으면 VACUUM + CHECKPOINT로 실제 공간 회수
+            if (anyDeletedThisIteration) {
+                for (String table : tables) {
+                    if (table == null || table.isBlank()) continue;
+                    try {
+                        repository.vacuumTable(config.getSchema(), table);
+                        log.info("VACUUM executed on {}.{}", config.getSchema(), table);
+                    } catch (Exception e) {
+                        log.warn("VACUUM failed for {}.{}: {}",
+                                config.getSchema(), table, e.getMessage());
+                    }
+                }
+                runCheckpoint();
             }
 
             Thread.sleep(5000);
+            double prevUsage = usage;
             usage = getUsagePercent();
-            log.info("After iteration {}, current disk usage: {}%", iteration, String.format("%.2f", usage));
+            log.info("After iteration {}, usage: {}% (delta: {}%)",
+                    iteration,
+                    BigDecimal.valueOf(usage).toPlainString(),
+                    BigDecimal.valueOf(usage - prevUsage).toPlainString());
 
+            // retention 공격적 감소 (일반 모드에서만)
             if (!forceDeleteMode) {
-                retention = Math.max(1, retention / 2);
+                if (retention > 30) retention = 30;
+                else if (retention > 7) retention = 7;
+                else if (retention > 1) retention = 1;
+                else if (retention > 0) retention = 0;
+                else {
+                    log.warn("retention=0 reached. Switching to FORCE DELETE mode.");
+                    forceDeleteMode = true;
+                }
+            }
+
+            // 진전 없으면 종료
+            if (!anyDeletedThisIteration) {
+                boolean canStillReduce = !forceDeleteMode && retention > 0;
+                boolean canEnterForceMode = !forceDeleteMode && retention == 0;
+
+                if (canStillReduce || canEnterForceMode) {
+                    // retention을 더 줄이거나 forceDelete로 갈 여지가 있으므로 카운트 안 함
+                    log.info("No deletion at retention={}, but reducing further or entering forceDelete.", retention);
+                } else {
+                    noProgressCount++;
+                    if (noProgressCount >= 3) {
+                        log.warn("No progress for 3 iterations even in forceDelete. Stopping cleanup.");
+                        break;
+                    }
+                }
+            } else {
+                noProgressCount = 0;
             }
 
             iteration++;
         }
 
-        log.info("Cleanup finished. Current usage: {}%", String.format("%.2f", getUsagePercent()));
+        log.info("Cleanup finished. Final usage: {}%",
+                BigDecimal.valueOf(getUsagePercent()).toPlainString());
     }
 
 }
