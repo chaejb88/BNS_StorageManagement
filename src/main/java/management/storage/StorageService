@@ -208,9 +208,11 @@ public class StorageService {
                     BigDecimal.valueOf(usage).toPlainString(),
                     BigDecimal.valueOf(usage - prevUsage).toPlainString());
 
-            // retention 공격적 감소 (일반 모드에서만)
+            // retention 감소
             if (!forceDeleteMode) {
-                if (retention > 30) retention = 30;
+                if (retention > 90) retention = 90;
+                else if (retention > 60) retention = 60;
+                else if (retention > 30) retention = 30;
                 else if (retention > 7) retention = 7;
                 else if (retention > 1) retention = 1;
                 else if (retention > 0) retention = 0;
