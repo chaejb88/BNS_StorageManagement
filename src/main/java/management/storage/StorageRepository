@@ -1,6 +1,5 @@
 package management.storage;
 
-import java.time.LocalDateTime;
 import java.util.List;
 
 public interface StorageRepository {
@@ -17,8 +16,7 @@ public interface StorageRepository {
 
     void releaseLock(String lockKey);
 
-    int countRowsOlderThan(String schema, String table, int days);
-
     List<String> showChunksOlderThan(String schema, String table, int days);
 
+    void vacuumTable(String schema, String table);
 }
