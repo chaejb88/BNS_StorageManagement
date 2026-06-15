@@ -4,6 +4,8 @@ import lombok.Getter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Configuration;
 
+import java.util.concurrent.atomic.AtomicReference;
+
 @Configuration
 @Getter
 public class StorageConfig {
@@ -11,11 +13,16 @@ public class StorageConfig {
     @Value("${storage.disk.path}")
     private String diskPath;
 
+    /** 폴백 값: DB에 type 행이 없거나 DB 조회 실패 시에만 사용 */
     @Value("${storage.threshold1}")
-    private double threshold1;
+    private double defaultThreshold1;
 
     @Value("${storage.threshold2}")
-    private double threshold2;
+    private double defaultThreshold2;
+
+    /** 런타임 임계치 (DB의 hw_critical 테이블에서 가져옴) */
+    private final AtomicReference<Double> threshold1 = new AtomicReference<>();
+    private final AtomicReference<Double> threshold2 = new AtomicReference<>();
 
     @Value("${storage.batchsize}")
     private int batchSize;
@@ -28,4 +35,29 @@ public class StorageConfig {
 
     @Value("${storage.schema}")
     private String schema;
+
+    /** hw_critical 테이블에서 추적할 type 값 (storage-management 전용) */
+    @Value("${storage.target-type}")
+    private int targetType;
+
+    /**
+     * 현재 적용 중인 threshold1 반환. DB값이 없으면 폴백값 사용.
+     */
+    public double getThreshold1() {
+        Double v = threshold1.get();
+        return v != null ? v : defaultThreshold1;
+    }
+
+    public double getThreshold2() {
+        Double v = threshold2.get();
+        return v != null ? v : defaultThreshold2;
+    }
+
+    /**
+     * DB에서 가져온 값으로 갱신 (StorageListener에서 호출)
+     */
+    public void updateThresholds(double newThreshold1, double newThreshold2) {
+        threshold1.set(newThreshold1);
+        threshold2.set(newThreshold2);
+    }
 }
