@@ -75,7 +75,6 @@ public class StorageService {
         }
 
         try {
-
             double usage = getUsagePercent();
             double t1 = config.getThreshold1();
             double t2 = config.getThreshold2();
@@ -103,8 +102,10 @@ public class StorageService {
                 cleanupUntilThreshold1();
                 runCheckpoint();
             }
-        }catch (Exception ex) {
+        } catch (Exception ex) {
             log.error("Failed to checkStorage {}", ex.getMessage(), ex);
+        } finally {
+            running.set(false);   // 어떤 경로로 종료하든 반드시 리셋
         }
     }
 
