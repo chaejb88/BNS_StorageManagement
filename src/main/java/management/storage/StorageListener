@@ -1,0 +1,345 @@
+package management.storage;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PreDestroy;
+import lombok.extern.slf4j.Slf4j;
+import org.postgresql.PGConnection;
+import org.postgresql.PGNotification;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.ApplicationArguments;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.core.annotation.Order;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * StorageListener
+ *
+ * PostgreSQL의 NOTIFY 채널(hw_critical_channel)을 구독하여
+ * hw_critical 테이블의 target type 행 변경을 실시간으로 받아 StorageConfig에 반영합니다.
+ *
+ * 동작:
+ *  1. 애플리케이션 시작 시 DB에서 target type 행 조회 → StorageConfig 초기화
+ *  2. LISTEN hw_critical_channel 시작
+ *  3. NOTIFY 수신 시 target type 변경이면 StorageConfig 갱신
+ *  4. threshold 값이 실제로 변경되었으면 storageService.checkStorage()를 비동기로 실행
+ *     (변경된 threshold가 즉시 반영되도록)
+ */
+@Slf4j
+@Service
+@Order(1)
+public class StorageListener implements ApplicationRunner {
+
+    private static final String CHANNEL = "hw_critical_channel";
+
+    private static final int INITIAL_LOAD_MAX_RETRIES = 5;
+    private static final int INITIAL_LOAD_BASE_DELAY_SEC = 2;
+
+    private final JdbcTemplate managementJdbcTemplate;
+    private final StorageRepository storageRepository;
+    private final StorageConfig storageConfig;
+    private final StorageService storageService;   // ★ 추가
+
+    private volatile boolean running = true;
+    private Connection conn;
+    private PGConnection pgConn;
+
+    /** checkStorage 비동기 실행용 단일 스레드 (NOTIFY 스레드를 막지 않기 위함) */
+    private final ExecutorService checkExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "storage-check-trigger");
+        t.setDaemon(true);
+        return t;
+    });
+
+    /** checkStorage 중복 실행 방지 플래그 */
+    private final AtomicBoolean checking = new AtomicBoolean(false);
+
+    public StorageListener(@Qualifier("managementJdbcTemplate") JdbcTemplate managementJdbcTemplate,
+                           StorageRepository storageRepository,
+                           StorageConfig storageConfig,
+                           StorageService storageService) {   // ★ 추가
+        this.managementJdbcTemplate = managementJdbcTemplate;
+        this.storageRepository = storageRepository;
+        this.storageConfig = storageConfig;
+        this.storageService = storageService;
+    }
+
+    @Override
+    public void run(ApplicationArguments args) {
+        try {
+            loadInitialThresholds();
+            establishListen();
+
+            Thread listenerThread = new Thread(this::listenLoop, "storage-listener-thread");
+            listenerThread.setDaemon(true);
+            listenerThread.start();
+
+            log.info("StorageListener started. Channel={}, target type={}",
+                    CHANNEL, storageConfig.getTargetType());
+        } catch (Exception e) {
+            log.error("StorageListener initialization failed", e);
+        }
+    }
+
+    private void loadInitialThresholds() {
+        int targetType = storageConfig.getTargetType();
+
+        for (int attempt = 1; attempt <= INITIAL_LOAD_MAX_RETRIES; attempt++) {
+            try {
+                double[] thresholds = storageRepository.findThresholdsByType(targetType);
+
+                if (thresholds != null) {
+                    storageConfig.updateThresholds(thresholds[0], thresholds[1]);
+                    log.info("Initial thresholds loaded from DB (type={}, attempt={}): threshold1={}, threshold2={}",
+                            targetType, attempt, thresholds[0], thresholds[1]);
+                    return;
+                }
+
+                log.warn("No hw_critical row found for type={}. Using fallback values from properties: threshold1={}, threshold2={}",
+                        targetType,
+                        storageConfig.getDefaultThreshold1(),
+                        storageConfig.getDefaultThreshold2());
+                return;
+
+            } catch (Exception e) {
+                log.warn("Failed to query hw_critical (attempt {}/{}): {}",
+                        attempt, INITIAL_LOAD_MAX_RETRIES, e.getMessage());
+
+                if (attempt < INITIAL_LOAD_MAX_RETRIES) {
+                    long delaySec = Math.min(INITIAL_LOAD_BASE_DELAY_SEC * (1L << (attempt - 1)), 30);
+                    log.info("Retrying in {} seconds...", delaySec);
+                    sleepSeconds((int) delaySec);
+                }
+            }
+        }
+
+        log.error("Failed to load thresholds from DB after {} attempts. Using fallback values from properties: threshold1={}, threshold2={}",
+                INITIAL_LOAD_MAX_RETRIES,
+                storageConfig.getDefaultThreshold1(),
+                storageConfig.getDefaultThreshold2());
+    }
+
+    private synchronized void establishListen() throws SQLException {
+        if (conn != null) {
+            try { conn.close(); } catch (Exception ignore) {}
+            conn = null;
+            pgConn = null;
+        }
+        conn = managementJdbcTemplate.getDataSource().getConnection();
+        pgConn = conn.unwrap(PGConnection.class);
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute("LISTEN " + CHANNEL);
+        }
+        log.info("LISTEN {} established", CHANNEL);
+    }
+
+    private void listenLoop() {
+        int retryDelaySec = 1;
+
+        while (running) {
+            try {
+                if (pgConn == null) {
+                    try {
+                        establishListen();
+                        retryDelaySec = 1;
+                    } catch (Exception e) {
+                        log.warn("Failed to establish LISTEN, retrying in {}s: {}",
+                                retryDelaySec, e.getMessage());
+                        sleepSeconds(retryDelaySec);
+                        retryDelaySec = Math.min(retryDelaySec * 2, 60);
+                        continue;
+                    }
+                }
+
+                PGNotification[] notifications = pgConn.getNotifications(1000);
+                if (notifications != null) {
+                    for (PGNotification notification : notifications) {
+                        if (CHANNEL.equals(notification.getName())) {
+                            log.debug("{} notification received", CHANNEL);
+                            try {
+                                processEvent(notification.getParameter());
+                            } catch (Exception ex) {
+                                log.error("Error while processing hw_critical event", ex);
+                            }
+                        }
+                    }
+                }
+                retryDelaySec = 1;
+
+            } catch (SQLException sqle) {
+                log.error("PostgreSQL NOTIFY exception", sqle);
+                try { if (conn != null && !conn.isClosed()) conn.close(); } catch (Exception ignore) {}
+                conn = null;
+                pgConn = null;
+                sleepSeconds(retryDelaySec);
+                retryDelaySec = Math.min(retryDelaySec * 2, 60);
+
+            } catch (Exception e) {
+                log.error("Unexpected exception in StorageListener loop", e);
+                sleepSeconds(1);
+            }
+        }
+    }
+
+    private void processEvent(String payload) {
+        if (payload == null || payload.isBlank()) {
+            log.warn("Empty payload received on {}", CHANNEL);
+            return;
+        }
+
+        int targetType = storageConfig.getTargetType();
+        boolean thresholdActuallyChanged = false;   // ★ 추가
+
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode event = mapper.readTree(payload);
+
+            String tableName = event.has("table") ? event.get("table").asText() : null;
+            String operation = event.has("operation") ? event.get("operation").asText() : null;
+            JsonNode dataNode = event.has("data") ? event.get("data") : null;
+
+            log.info("[StorageListener] table={}, operation={}", tableName, operation);
+
+            if (dataNode == null || dataNode.isNull()) {
+                log.warn("[StorageListener] data node is null");
+                return;
+            }
+
+            int type = dataNode.has("type") ? dataNode.get("type").asInt(-1) : -1;
+            if (type != targetType) {
+                log.debug("[StorageListener] Ignoring type={} (target type={})", type, targetType);
+                return;
+            }
+
+            // DELETE 시 DB에서 다시 조회
+            if ("DELETE".equalsIgnoreCase(operation)) {
+                log.info("[StorageListener] type={} row deleted. Reloading from DB.", type);
+                double oldT1 = storageConfig.getThreshold1();
+                double oldT2 = storageConfig.getThreshold2();
+
+                double[] reloaded = storageRepository.findThresholdsByType(targetType);
+                if (reloaded != null) {
+                    storageConfig.updateThresholds(reloaded[0], reloaded[1]);
+                    log.info("[StorageListener] Reloaded after DELETE: threshold1={}, threshold2={}",
+                            reloaded[0], reloaded[1]);
+                    thresholdActuallyChanged = (oldT1 != reloaded[0]) || (oldT2 != reloaded[1]);
+                } else {
+                    double fallbackT1 = storageConfig.getDefaultThreshold1();
+                    double fallbackT2 = storageConfig.getDefaultThreshold2();
+                    storageConfig.updateThresholds(fallbackT1, fallbackT2);
+                    log.info("[StorageListener] No type={} row left. Restored to fallback values: t1={}, t2={}",
+                            targetType, fallbackT1, fallbackT2);
+                    thresholdActuallyChanged = (oldT1 != fallbackT1) || (oldT2 != fallbackT2);
+                }
+
+                if (thresholdActuallyChanged) {
+                    triggerCheckStorageAsync();
+                }
+                return;
+            }
+
+            int useYn = dataNode.has("use_yn") ? dataNode.get("use_yn").asInt(0) : 0;
+            if (useYn != 0) {
+                log.warn("[StorageListener] type={} row is disabled (use_yn={}). Skipping update.",
+                        type, useYn);
+                return;
+            }
+
+            if (!dataNode.has("warn_value") || !dataNode.has("critical_value")) {
+                log.warn("[StorageListener] warn_value or critical_value missing in payload");
+                return;
+            }
+
+            double newT1 = dataNode.get("warn_value").asDouble();
+            double newT2 = dataNode.get("critical_value").asDouble();
+
+            if (newT1 < 0 || newT1 > 100 || newT2 < 0 || newT2 > 100) {
+                log.warn("[StorageListener] Invalid threshold values: t1={}, t2={}", newT1, newT2);
+                return;
+            }
+            if (newT1 >= newT2) {
+                log.warn("[StorageListener] threshold1 ({}) must be < threshold2 ({}). Ignoring.",
+                        newT1, newT2);
+                return;
+            }
+
+            double oldT1 = storageConfig.getThreshold1();
+            double oldT2 = storageConfig.getThreshold2();
+
+            storageConfig.updateThresholds(newT1, newT2);
+
+            log.info("[StorageListener] Thresholds updated for type={}: threshold1={}->{}, threshold2={}->{}",
+                    type, oldT1, newT1, oldT2, newT2);
+
+            // 값이 실제로 변경되었으면 즉시 체크 트리거
+            thresholdActuallyChanged = (oldT1 != newT1) || (oldT2 != newT2);
+
+            if (thresholdActuallyChanged) {
+                triggerCheckStorageAsync();
+            } else {
+                log.debug("[StorageListener] threshold values unchanged. Skip checkStorage trigger.");
+            }
+
+        } catch (Exception e) {
+            log.error("Failed to process hw_critical event. payload={}", payload, e);
+        }
+    }
+
+    /**
+     * threshold 변경 시 storageService.checkStorage()를 비동기로 실행.
+     * - NOTIFY 처리 스레드를 막지 않기 위해 별도 스레드 풀에서 실행
+     * - 중복 실행 방지: 이미 실행 중이면 skip
+     */
+    private void triggerCheckStorageAsync() {
+        if (!checking.compareAndSet(false, true)) {
+            log.info("[StorageListener] checkStorage already in progress. Skipping trigger.");
+            return;
+        }
+
+        checkExecutor.submit(() -> {
+            try {
+                log.info("[StorageListener] Triggering checkStorage due to threshold change");
+                storageService.checkStorage();
+                log.info("[StorageListener] Triggered checkStorage completed");
+            } catch (Exception e) {
+                log.error("[StorageListener] Triggered checkStorage failed", e);
+            } finally {
+                checking.set(false);
+            }
+        });
+    }
+
+    private void sleepSeconds(int sec) {
+        try {
+            Thread.sleep(sec * 1000L);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        running = false;
+        try {
+            if (conn != null && !conn.isClosed()) {
+                conn.close();
+            }
+        } catch (Exception e) {
+            log.warn("Error closing StorageListener connection: {}", e.getMessage());
+        }
+        try {
+            checkExecutor.shutdownNow();
+        } catch (Exception e) {
+            log.warn("Failed to shutdown checkExecutor: {}", e.getMessage());
+        }
+        log.info("StorageListener shut down");
+    }
+}
