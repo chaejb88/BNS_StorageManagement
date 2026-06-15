@@ -59,13 +59,11 @@ public class StorageListener implements ApplicationRunner {
         return t;
     });
 
-    /** checkStorage 중복 실행 방지 플래그 */
-    private final AtomicBoolean checking = new AtomicBoolean(false);
 
     public StorageListener(@Qualifier("managementJdbcTemplate") JdbcTemplate managementJdbcTemplate,
                            StorageRepository storageRepository,
                            StorageConfig storageConfig,
-                           StorageService storageService) {   // ★ 추가
+                           StorageService storageService) {
         this.managementJdbcTemplate = managementJdbcTemplate;
         this.storageRepository = storageRepository;
         this.storageConfig = storageConfig;
@@ -296,14 +294,8 @@ public class StorageListener implements ApplicationRunner {
     /**
      * threshold 변경 시 storageService.checkStorage()를 비동기로 실행.
      * - NOTIFY 처리 스레드를 막지 않기 위해 별도 스레드 풀에서 실행
-     * - 중복 실행 방지: 이미 실행 중이면 skip
      */
     private void triggerCheckStorageAsync() {
-        if (!checking.compareAndSet(false, true)) {
-            log.info("[StorageListener] checkStorage already in progress. Skipping trigger.");
-            return;
-        }
-
         checkExecutor.submit(() -> {
             try {
                 log.info("[StorageListener] Triggering checkStorage due to threshold change");
@@ -311,8 +303,6 @@ public class StorageListener implements ApplicationRunner {
                 log.info("[StorageListener] Triggered checkStorage completed");
             } catch (Exception e) {
                 log.error("[StorageListener] Triggered checkStorage failed", e);
-            } finally {
-                checking.set(false);
             }
         });
     }
