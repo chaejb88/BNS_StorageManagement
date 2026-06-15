@@ -8,6 +8,7 @@ import java.math.BigDecimal;
 import java.util.List;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Slf4j
 @Service
@@ -16,12 +17,7 @@ public class StorageService {
 
     private final StorageConfig config;
     private final StorageRepository repository;
-
-    /**
-     * 프로세스 간 동시 실행을 방지하기 위한 advisory lock 키
-     * - DB의 pg_try_advisory_lock / pg_advisory_unlock에 사용됩니다.
-     */
-    private static final String LOCK_KEY = "storage-cleanup-lock";
+    private final AtomicBoolean running = new AtomicBoolean(false);
 
     /**
      * getUsagePercent
@@ -73,13 +69,12 @@ public class StorageService {
      * @throws InterruptedException cleanup 루프에서 Thread.sleep이 인터럽트될 경우 전달됨
      */
     public void checkStorage() throws InterruptedException {
-        boolean locked = false;
+        if (!running.compareAndSet(false, true)) {
+            log.info("checkStorage already running. Skipping.");
+            return;
+        }
+
         try {
-            locked = repository.tryAcquireLock(LOCK_KEY);
-            if (!locked) {
-                log.info("Another cleanup is running. Exiting.");
-                return;
-            }
 
             double usage = getUsagePercent();
             double t1 = config.getThreshold1();
@@ -108,10 +103,8 @@ public class StorageService {
                 cleanupUntilThreshold1();
                 runCheckpoint();
             }
-        } finally {
-            if (locked) {
-                repository.releaseLock(LOCK_KEY);
-            }
+        }catch (Exception ex) {
+            log.error("Failed to checkStorage {}", ex.getMessage(), ex);
         }
     }
 
